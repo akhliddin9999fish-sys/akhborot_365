@@ -12,7 +12,6 @@ from pathlib import Path
 
 import feedparser
 import requests
-from deep_translator import GoogleTranslator
 
 FEEDS = [
     f.strip()
@@ -25,20 +24,49 @@ MAX_POSTS = int(os.getenv("MAX_POSTS", "10"))  # сколько постов з�
 LANG = os.getenv("LANG_TARGET", "tg")  # tg = таджикский
 READ_MORE = "Мақоларо дар economist.com хонед"
 STATE_FILE = Path("posted.json")
+HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
-translator = GoogleTranslator(source="en", target=LANG)
+
+def translate_google(text: str) -> str:
+    r = requests.get(
+        "https://translate.googleapis.com/translate_a/single",
+        params={"client": "gtx", "sl": "en", "tl": LANG, "dt": "t", "q": text},
+        headers=HEADERS,
+        timeout=20,
+    )
+    r.raise_for_status()
+    return "".join(part[0] for part in r.json()[0] if part and part[0])
 
 
-def translate(text: str) -> str:
+def translate_mymemory(text: str) -> str:
+    r = requests.get(
+        "https://api.mymemory.translated.net/get",
+        params={"q": text, "langpair": f"en|{LANG}"},
+        headers=HEADERS,
+        timeout=20,
+    )
+    r.raise_for_status()
+    data = r.json()
+    if data.get("responseStatus") != 200:
+        raise RuntimeError(data.get("responseDetails"))
+    return data["responseData"]["translatedText"]
+
+
+def translate(text: str) -> str | None:
+    """Возвращает перевод или None, если ни один сервис не сработал."""
     if not text:
-        return text
-    for attempt in range(3):
-        try:
-            return translator.translate(text) or text
-        except Exception as e:  # сбой перевода — пробуем ещё раз
-            print(f"Ошибка перевода ({attempt + 1}/3): {e}")
-            time.sleep(3)
-    return text  # если перевод так и не удался, публикуем оригинал
+        return ""
+    for service in (translate_google, translate_mymemory):
+        for attempt in range(2):
+            try:
+                result = service(text).strip()
+                if result and result.lower() != text.lower():
+                    return result
+                raise RuntimeError("пустой или непереведённый ответ")
+            except Exception as e:
+                print(f"Перевод через {service.__name__} не удался ({attempt + 1}/2): {e}")
+                time.sleep(2)
+    return None
 
 
 def load_state() -> list[str]:
@@ -81,23 +109,23 @@ def collect_entries(posted: set[str]) -> list[dict]:
     return sorted(items.values(), key=lambda x: x["ts"])[-MAX_POSTS:]
 
 
-def send(item: dict) -> None:
-    title = html.escape(translate(item["title"]))
-    summary = html.escape(translate(item["summary"]))
-    text = f"<b>{title}</b>"
+def send(item: dict) -> bool:
+    """Публикует пост. Возвращает False, если перевести не удалось."""
+    title = translate(item["title"])
+    summary = translate(item["summary"])
+    if title is None or summary is None:
+        print(f"Пропускаю (нет перевода), попробую в следующий раз: {item['link']}")
+        return False
+
+    text = f"<b>{html.escape(title)}</b>"
     if summary:
-        text += f"\n\n{summary}"
+        text += f"\n\n{html.escape(summary)}"
     text += f'\n\n<a href="{item["link"]}">{READ_MORE}</a>'
 
     while True:
         r = requests.post(
             f"https://api.telegram.org/bot{TOKEN}/sendMessage",
-            json={
-                "chat_id": CHANNEL,
-                "text": text,
-                "parse_mode": "HTML",
-                "disable_web_page_preview": False,
-            },
+            json={"chat_id": CHANNEL, "text": text, "parse_mode": "HTML"},
             timeout=30,
         )
         if r.status_code == 429:  # Telegram просит подождать
@@ -106,18 +134,25 @@ def send(item: dict) -> None:
         if not r.ok:
             print("Ответ Telegram:", r.text)
         r.raise_for_status()
-        return
+        return True
 
 
 def main() -> None:
     posted = load_state()
     new_items = collect_entries(set(posted))
     print(f"Новых материалов: {len(new_items)}")
+    failed = 0
     for item in new_items:
-        send(item)
-        posted.append(item["link"])
-        save_state(posted)  # сохраняем после каждого поста
-        time.sleep(3)
+        if send(item):
+            posted.append(item["link"])
+            save_state(posted)  # сохраняем после каждого поста
+            time.sleep(3)
+        else:
+            failed += 1
+            if failed >= 2:  # сервисы перевода недоступны — не тратим время
+                print("Перевод недоступен, остальное опубликую при следующей проверке.")
+                break
+    save_state(posted)
 
 
 if __name__ == "__main__":
